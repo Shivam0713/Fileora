@@ -1,0 +1,40 @@
+services:
+  frontend:
+    profiles: ["container-frontend"]
+    image: node:22-bookworm-slim
+    restart: unless-stopped
+    working_dir: /app
+    volumes: ["./frontend:/app", "/app/node_modules"]
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    ports: ["5173:5173"]
+    depends_on: [api]
+  api:
+    image: fileora-backend
+    build: ./backend
+    env_file: ./backend/.env
+    ports: ["8000:8000"]
+    volumes: ["fileora-data:/data/fileora"]
+    depends_on: [mongo, redis]
+  worker:
+    image: fileora-backend
+    env_file: ./backend/.env
+    volumes: ["fileora-data:/data/fileora"]
+    command: ["celery", "-A", "app.workers.celery_app:celery", "worker", "--loglevel=INFO"]
+    depends_on: [mongo, redis]
+  scheduler:
+    image: fileora-backend
+    env_file: ./backend/.env
+    volumes: ["fileora-data:/data/fileora"]
+    command: ["celery", "-A", "app.workers.celery_app:celery", "beat", "--loglevel=INFO"]
+    depends_on: [mongo, redis]
+  redis:
+    image: redis:7-bookworm
+    restart: unless-stopped
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 10}
+  mongo:
+    image: mongo:7
+    volumes: ["mongo-data:/data/db"]
+    healthcheck: {test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"], interval: 5s, timeout: 3s, retries: 10}
+volumes:
+  fileora-data:
+  mongo-data:
