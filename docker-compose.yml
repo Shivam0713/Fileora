@@ -14,19 +14,25 @@ services:
     env_file: ./backend/.env
     ports: ["8000:8000"]
     volumes: ["fileora-data:/data/fileora"]
-    depends_on: [mongo, redis]
+    depends_on:
+      mongo: {condition: service_healthy}
+      redis: {condition: service_healthy}
   worker:
     image: fileora-backend
     env_file: ./backend/.env
     volumes: ["fileora-data:/data/fileora"]
     command: ["celery", "-A", "app.workers.celery_app:celery", "worker", "--loglevel=INFO"]
-    depends_on: [mongo, redis]
+    depends_on:
+      mongo: {condition: service_healthy}
+      redis: {condition: service_healthy}
   scheduler:
     image: fileora-backend
     env_file: ./backend/.env
     volumes: ["fileora-data:/data/fileora"]
     command: ["celery", "-A", "app.workers.celery_app:celery", "beat", "--loglevel=INFO"]
-    depends_on: [mongo, redis]
+    depends_on:
+      mongo: {condition: service_healthy}
+      redis: {condition: service_healthy}
   redis:
     image: redis:7-bookworm
     restart: unless-stopped

@@ -1,15 +1,14 @@
 from datetime import datetime, timezone
 from pathlib import Path
-import shutil
 import tempfile
 import warnings
 from bson import ObjectId
 from PIL import Image
-from app.core.config import settings
 from app.database import db
 from app.registry import get_tool
 from app.processors import run_conversion
 from app.workers.celery_app import celery
+from app.storage import delete as delete_stored_file, download_to_path, put_path
 
 Image.MAX_IMAGE_PIXELS = 40_000_000
 warnings.simplefilter("error", Image.DecompressionBombWarning)
@@ -21,7 +20,7 @@ def cleanup_expired():
     now = datetime.now(timezone.utc)
     expired = list(db.files.find({"expires_at":{"$lte":now}}, {"storage_key":1}))
     for item in expired:
-        (Path(settings.storage_dir) / item["storage_key"]).unlink(missing_ok=True)
+        delete_stored_file(item["storage_key"])
     if expired:
         ids = [item["_id"] for item in expired]
         str_ids = [str(i) for i in ids]
@@ -61,7 +60,7 @@ def process_conversion(self, job_id: str):
         return
     now=datetime.now(timezone.utc)
     db.jobs.update_one({"_id":job["_id"]},{"$set":{"status":"processing","updated_at":now}})
-    destination=None
+    output_key=None
     try:
         tool=get_tool(job["tool_slug"])
         file_ids=job.get("file_ids") or [job["file_id"]]
@@ -70,23 +69,33 @@ def process_conversion(self, job_id: str):
         documents.sort(key=lambda item:source_ids.index(item["_id"]))
         if not tool or not tool["available"] or len(documents)!=len(source_ids):
             raise ValueError("One or more input files are unavailable or expired.")
-        sources=[{"path":Path(settings.storage_dir)/item["storage_key"],"name":item["original_name"],"format":item["format"]} for item in documents]
         out_id=str(ObjectId())
-        destination=Path(settings.storage_dir)/out_id
-        with tempfile.TemporaryDirectory(dir=settings.storage_dir,prefix="job-") as temp:
-            processed,output_format,download_name=run_conversion(job["tool_slug"],sources,job["options"],Path(temp))
+        with tempfile.TemporaryDirectory(prefix="fileora-job-") as temp:
+            temp_path=Path(temp)
+            input_dir=temp_path/"inputs"
+            work_dir=temp_path/"work"
+            input_dir.mkdir()
+            work_dir.mkdir()
+            sources=[]
+            for index,item in enumerate(documents):
+                source_path=input_dir/f"{index}-{Path(item['original_name']).name}"
+                download_to_path(item["storage_key"],source_path)
+                sources.append({"path":source_path,"name":item["original_name"],"format":item["format"]})
+            processed,output_format,download_name=run_conversion(job["tool_slug"],sources,job["options"],work_dir)
             if not processed.is_file() or not 0 < processed.stat().st_size <= MAX_OUTPUT_BYTES:
                 raise ValueError("The conversion output is empty or exceeds the size limit.")
             validate_output(processed,output_format)
-            shutil.copyfile(processed,destination)
+            output_size=processed.stat().st_size
+            put_path(out_id,processed)
+            output_key=out_id
         now=datetime.now(timezone.utc)
-        db.files.insert_one({"_id":ObjectId(out_id),"owner":job["owner"],"original_name":Path(download_name).name[:180],"format":output_format,"size":destination.stat().st_size,"storage_key":out_id,"expires_at":documents[0]["expires_at"],"created_at":now,"is_output":True})
+        db.files.insert_one({"_id":ObjectId(out_id),"owner":job["owner"],"original_name":Path(download_name).name[:180],"format":output_format,"size":output_size,"storage_key":out_id,"expires_at":documents[0]["expires_at"],"created_at":now,"is_output":True})
         db.jobs.update_one({"_id":job["_id"]},{"$set":{"status":"completed","output_file_id":out_id,"updated_at":now}})
     except (OSError,ValueError,KeyError,IndexError):
-        if destination:
-            destination.unlink(missing_ok=True)
+        if output_key:
+            delete_stored_file(output_key)
         db.jobs.update_one({"_id":job["_id"]},{"$set":{"status":"failed","error":"This file could not be processed. Check the input and options, then try again.","updated_at":datetime.now(timezone.utc)}})
     except Exception:
-        if destination:
-            destination.unlink(missing_ok=True)
+        if output_key:
+            delete_stored_file(output_key)
         db.jobs.update_one({"_id":job["_id"]},{"$set":{"status":"failed","error":"Conversion failed. Please try a valid supported file.","updated_at":datetime.now(timezone.utc)}})
